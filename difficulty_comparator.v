@@ -50,7 +50,7 @@ module difficulty_comparator (
     // -------------------------------------------------------------------------
     // Nonce delay pipeline — 65 stages to match Pass 2 latency
     // -------------------------------------------------------------------------
-    localparam PASS2_LATENCY = 65;
+    localparam PASS2_LATENCY = 71;  // updated: sha256_core latency = 64 rounds + 1 IV-add + 6 W-pipeline stages
 
     reg [31:0] nonce_pipe [0:PASS2_LATENCY-1];
     integer i;
@@ -68,19 +68,6 @@ module difficulty_comparator (
 
     wire [31:0] matched_nonce = nonce_pipe[PASS2_LATENCY-1];
 
-    // -------------------------------------------------------------------------
-    // 256-bit comparison: hash < target
-    // Bitcoin hashes are compared as big-endian 256-bit integers.
-    // hash_out[255:224] is the most significant word.
-    // We compare word by word from MSW to LSW.
-    //
-    // Implementation: subtract target from hash. If there's a borrow out,
-    // hash < target. This is the most synthesis-efficient approach.
-    //
-    // For FPGA: use a carry-chain subtraction.
-    // For critical path: this is a 256-bit comparator — one combinational
-    // level. Synthesis will build it as a tree of 32-bit comparators.
-    // -------------------------------------------------------------------------
     wire less_than;
 
     // 256-bit less-than via hierarchical 32-bit comparison

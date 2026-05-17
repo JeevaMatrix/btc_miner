@@ -1,40 +1,3 @@
-// =============================================================================
-// File        : sha256_core.v
-// Project     : SHA-256 Core for FPGA Bitcoin Miner
-// Author      : Industry-Grade RTL Design
-// Standard    : Verilog-2001 / SystemVerilog compatible
-//
-// Description :
-//   Fully pipelined SHA-256 compression core.
-//   - 512-bit padded message block in, 256-bit digest out.
-//   - 64-stage pipeline: one hash result every clock after LATENCY cycles.
-//   - Each stage holds registered {a,b,c,d,e,f,g,h} working variables
-//     plus the pre-computed W[t] and K[t] for that stage.
-//   - Pipeline flush/valid tracking via a shift-register.
-//   - Initial hash values H0..H7 are the standard SHA-256 IVs (FIPS 180-4).
-//     For Bitcoin double-SHA the midstate can be injected via h_init_* ports.
-//
-// Port Map:
-//   clk          — system clock (all registers on posedge)
-//   rst_n        — active-low synchronous reset
-//   init         — pulse high for 1 cycle to inject custom H init (midstate)
-//   h_init_*     — optional custom initial hash values (midstate injection)
-//   block_valid  — assert when block_in contains a valid 512-bit block
-//   block_in     — 512-bit padded SHA-256 message block (big-endian)
-//   hash_valid   — pulses high when hash_out is valid (LATENCY clocks later)
-//   hash_out     — 256-bit SHA-256 digest (big-endian)
-//
-// Latency      : 64 + 1 clock cycles (pipeline depth)
-// Throughput   : 1 hash / clock (100% utilisation after fill)
-// Target       : Xilinx 7-series / UltraScale / Intel Cyclone V / Arria 10
-//
-// Bitcoin Note :
-//   For Bitcoin mining:
-//     Round 1: SHA256(block_header[0:511])  → midstate
-//     Round 2: SHA256(block_header[512:639] padded) using midstate as IV
-//   Inject midstate using h_init_* + init=1 before asserting block_valid.
-// =============================================================================
-
 `include "sha256_functions.vh"
 
 module sha256_core (
@@ -42,7 +5,7 @@ module sha256_core (
     input  wire          rst_n,
 
     // Optional midstate injection (for Bitcoin double-SHA optimisation)
-    input  wire          init,          // 1 = load h_init_* as IVs this cycle
+    input  wire          init,
     input  wire [31:0]   h_init_0,
     input  wire [31:0]   h_init_1,
     input  wire [31:0]   h_init_2,
@@ -53,22 +16,22 @@ module sha256_core (
     input  wire [31:0]   h_init_7,
 
     // Data path
-    input  wire          block_valid,   // block_in is valid this cycle
-    input  wire [511:0]  block_in,      // 512-bit padded message block
+    input  wire          block_valid,
+    input  wire [511:0]  block_in,
 
-    output reg           hash_valid,    // hash_out is valid this cycle
-    output reg  [255:0]  hash_out       // 256-bit digest
+    output reg           hash_valid,
+    output reg  [255:0]  hash_out
 );
 
     // =========================================================================
     // Parameters
     // =========================================================================
-    localparam ROUNDS   = 64;
-    localparam LATENCY  = ROUNDS + 1;   // 65 cycles: 64 compress + 1 add IV
+    localparam ROUNDS      = 64;
+    localparam WMSG_STAGES = 6;          // 6 stages × 8 words = 48 expanded words
+    localparam LATENCY     = ROUNDS + 1 + WMSG_STAGES;  // 71 cycles total
 
     // =========================================================================
-    // Standard SHA-256 Initial Hash Values H0..H7 (FIPS 180-4 §5.3.3)
-    // Fractional parts of square roots of first 8 primes
+    // Standard SHA-256 Initial Hash Values (FIPS 180-4 §5.3.3)
     // =========================================================================
     localparam [31:0] IV_H0 = 32'h6a09e667;
     localparam [31:0] IV_H1 = 32'hbb67ae85;
@@ -83,7 +46,6 @@ module sha256_core (
     // Round Constants K[0..63] (FIPS 180-4 §4.2.2)
     // =========================================================================
     wire [31:0] K [0:63];
-
     assign K[ 0] = 32'h428a2f98; assign K[ 1] = 32'h71374491;
     assign K[ 2] = 32'hb5c0fbcf; assign K[ 3] = 32'he9b5dba5;
     assign K[ 4] = 32'h3956c25b; assign K[ 5] = 32'h59f111f1;
@@ -118,57 +80,101 @@ module sha256_core (
     assign K[62] = 32'hbef9a3f7; assign K[63] = 32'hc67178f2;
 
     // =========================================================================
-    // Message Schedule W[0..63] — combinational expand from block_in
+    // W[0..15] — directly unpacked from registered input block
+    // (same as original, no change)
     // =========================================================================
-    // We compute W entirely combinationally from the registered input.
-    // The synthesis tool will pipeline these naturally when retiming is on,
-    // or you can add explicit pipe stages here for very high fclk targets.
-    // =========================================================================
-    reg  [511:0] block_r;             // registered input block
-    wire [31:0]  W [0:63];
+    reg  [511:0] block_r;
 
-    // Register input block aligned with first round
     always @(posedge clk) begin
-        if (!rst_n)
-            block_r <= 512'b0;
-        else if (block_valid)
-            block_r <= block_in;
+        if (!rst_n)         block_r <= 512'b0;
+        else if (block_valid) block_r <= block_in;
     end
 
-    // Unpack W[0..15] from registered block (big-endian)
+    // W[0..15]: wires into block_r (zero extra latency)
+    wire [31:0] W_base [0:15];
     genvar gi;
     generate
         for (gi = 0; gi < 16; gi = gi + 1) begin : W_UNPACK
-            assign W[gi] = block_r[511 - 32*gi -: 32];
+            assign W_base[gi] = block_r[511 - 32*gi -: 32];
         end
     endgenerate
 
-    // Expand W[16..63]
+    // =========================================================================
+    // Pipelined Message Schedule  W[16..63]
+    // =========================================================================
+
+    // Flat register array: W_pipe[stage][word_within_stage]
+    reg [31:0] W_pipe [0:WMSG_STAGES-1][0:7];
+
+    // Helper function: index into the full W space.
+
+    wire [31:0] W_all [0:63];
+
+    // Lower 16: wires (block_r already registered)
     generate
-        for (gi = 16; gi < 64; gi = gi + 1) begin : W_EXPAND
-            assign W[gi] = `SSIG1(W[gi-2])
-                         + W[gi-7]
-                         + `SSIG0(W[gi-15])
-                         + W[gi-16];
+        for (gi = 0; gi < 16; gi = gi + 1) begin : WA_BASE
+            assign W_all[gi] = W_base[gi];
         end
     endgenerate
 
-    // =========================================================================
-    // Pipeline Registers: working variables per stage
-    // pipe_a[t] holds 'a' at the END of round t (i.e. after t+1 rounds done)
-    // pipe_a[0] holds the IV / initial working variables (before round 0)
-    // =========================================================================
-    reg [31:0] pipe_a [0:ROUNDS];
-    reg [31:0] pipe_b [0:ROUNDS];
-    reg [31:0] pipe_c [0:ROUNDS];
-    reg [31:0] pipe_d [0:ROUNDS];
-    reg [31:0] pipe_e [0:ROUNDS];
-    reg [31:0] pipe_f [0:ROUNDS];
-    reg [31:0] pipe_g [0:ROUNDS];
-    reg [31:0] pipe_h [0:ROUNDS];
+    // Upper 48: from pipeline registers
+    generate
+        for (gi = 0; gi < WMSG_STAGES; gi = gi + 1) begin : WA_PIPE_STAGE
+            // Each stage holds 8 words
+            // words 16+8*gi .. 16+8*gi+7
+            assign W_all[16 + 8*gi + 0] = W_pipe[gi][0];
+            assign W_all[16 + 8*gi + 1] = W_pipe[gi][1];
+            assign W_all[16 + 8*gi + 2] = W_pipe[gi][2];
+            assign W_all[16 + 8*gi + 3] = W_pipe[gi][3];
+            assign W_all[16 + 8*gi + 4] = W_pipe[gi][4];
+            assign W_all[16 + 8*gi + 5] = W_pipe[gi][5];
+            assign W_all[16 + 8*gi + 6] = W_pipe[gi][6];
+            assign W_all[16 + 8*gi + 7] = W_pipe[gi][7];
+        end
+    endgenerate
+
+    // -------------------------------------------------------------------------
+    // Stage register logic — iterate across all 6 stages and 8 words each
+    // -------------------------------------------------------------------------
+
+    genvar gs, gw;
+    generate
+        for (gs = 0; gs < WMSG_STAGES; gs = gs + 1) begin : W_STAGE
+            for (gw = 0; gw < 8; gw = gw + 1) begin : W_WORD
+                localparam integer T = 16 + 8*gs + gw;  // global W index
+
+                // Combinational expression — one SSIG1 + one SSIG0 + two adds
+                wire [31:0] w_comb;
+                assign w_comb = `SSIG1(W_all[T-2])
+                              + W_all[T-7]
+                              + `SSIG0(W_all[T-15])
+                              + W_all[T-16];
+
+                // Register the result — this is the pipeline stage flip-flop
+                always @(posedge clk) begin
+                    if (!rst_n)
+                        W_pipe[gs][gw] <= 32'b0;
+                    else
+                        W_pipe[gs][gw] <= w_comb;
+                end
+            end
+        end
+    endgenerate
+
+    // Extended compression pipeline depth
+    localparam PIPE_DEPTH = WMSG_STAGES + ROUNDS;  // 70 stages
+
+    reg [31:0] pipe_a [0:PIPE_DEPTH];
+    reg [31:0] pipe_b [0:PIPE_DEPTH];
+    reg [31:0] pipe_c [0:PIPE_DEPTH];
+    reg [31:0] pipe_d [0:PIPE_DEPTH];
+    reg [31:0] pipe_e [0:PIPE_DEPTH];
+    reg [31:0] pipe_f [0:PIPE_DEPTH];
+    reg [31:0] pipe_g [0:PIPE_DEPTH];
+    reg [31:0] pipe_h [0:PIPE_DEPTH];
 
     // =========================================================================
-    // IV registers — latched once per block (support midstate injection)
+    // IV registers
     // =========================================================================
     reg [31:0] iv_h0, iv_h1, iv_h2, iv_h3;
     reg [31:0] iv_h4, iv_h5, iv_h6, iv_h7;
@@ -180,7 +186,6 @@ module sha256_core (
             iv_h4 <= IV_H4; iv_h5 <= IV_H5;
             iv_h6 <= IV_H6; iv_h7 <= IV_H7;
         end else if (init) begin
-            // Midstate injection for Bitcoin double-SHA optimisation
             iv_h0 <= h_init_0; iv_h1 <= h_init_1;
             iv_h2 <= h_init_2; iv_h3 <= h_init_3;
             iv_h4 <= h_init_4; iv_h5 <= h_init_5;
@@ -193,32 +198,46 @@ module sha256_core (
     // =========================================================================
     always @(posedge clk) begin
         if (!rst_n) begin
-            pipe_a[0] <= 32'b0;
-            pipe_b[0] <= 32'b0;
-            pipe_c[0] <= 32'b0;
-            pipe_d[0] <= 32'b0;
-            pipe_e[0] <= 32'b0;
-            pipe_f[0] <= 32'b0;
-            pipe_g[0] <= 32'b0;
-            pipe_h[0] <= 32'b0;
+            pipe_a[0] <= 32'b0; pipe_b[0] <= 32'b0;
+            pipe_c[0] <= 32'b0; pipe_d[0] <= 32'b0;
+            pipe_e[0] <= 32'b0; pipe_f[0] <= 32'b0;
+            pipe_g[0] <= 32'b0; pipe_h[0] <= 32'b0;
         end else begin
-            pipe_a[0] <= iv_h0;
-            pipe_b[0] <= iv_h1;
-            pipe_c[0] <= iv_h2;
-            pipe_d[0] <= iv_h3;
-            pipe_e[0] <= iv_h4;
-            pipe_f[0] <= iv_h5;
-            pipe_g[0] <= iv_h6;
-            pipe_h[0] <= iv_h7;
+            pipe_a[0] <= iv_h0; pipe_b[0] <= iv_h1;
+            pipe_c[0] <= iv_h2; pipe_d[0] <= iv_h3;
+            pipe_e[0] <= iv_h4; pipe_f[0] <= iv_h5;
+            pipe_g[0] <= iv_h6; pipe_h[0] <= iv_h7;
         end
     end
 
     // =========================================================================
-    // Pipeline Stages 1..64: 64 compression rounds
-    // Each stage is one registered sha256_round instantiation.
+    // Bubble stages 1..WMSG_STAGES: just register-through while W pipeline fills
     // =========================================================================
+    generate
+        for (gi = 0; gi < WMSG_STAGES; gi = gi + 1) begin : BUBBLE
+            always @(posedge clk) begin
+                if (!rst_n) begin
+                    pipe_a[gi+1] <= 32'b0; pipe_b[gi+1] <= 32'b0;
+                    pipe_c[gi+1] <= 32'b0; pipe_d[gi+1] <= 32'b0;
+                    pipe_e[gi+1] <= 32'b0; pipe_f[gi+1] <= 32'b0;
+                    pipe_g[gi+1] <= 32'b0; pipe_h[gi+1] <= 32'b0;
+                end else begin
+                    pipe_a[gi+1] <= pipe_a[gi]; pipe_b[gi+1] <= pipe_b[gi];
+                    pipe_c[gi+1] <= pipe_c[gi]; pipe_d[gi+1] <= pipe_d[gi];
+                    pipe_e[gi+1] <= pipe_e[gi]; pipe_f[gi+1] <= pipe_f[gi];
+                    pipe_g[gi+1] <= pipe_g[gi]; pipe_h[gi+1] <= pipe_h[gi];
+                end
+            end
+        end
+    endgenerate
 
-    // Combinational round outputs (wires between flops)
+    // =========================================================================
+    // Compression Stages (WMSG_STAGES+1)..(WMSG_STAGES+ROUNDS):
+    // 64 SHA-256 rounds.  W_all[r] is used for round r.
+    // Because the compression pipeline is delayed by WMSG_STAGES cycles,
+    // W_pipe[s] has had s+1 register stages by the time round 16+8s runs.
+    // Everything lines up correctly.
+    // =========================================================================
     wire [31:0] rnd_a_out [0:ROUNDS-1];
     wire [31:0] rnd_b_out [0:ROUNDS-1];
     wire [31:0] rnd_c_out [0:ROUNDS-1];
@@ -231,20 +250,18 @@ module sha256_core (
     generate
         for (gi = 0; gi < ROUNDS; gi = gi + 1) begin : COMPRESS
 
-            // ------------------------------------------------------------------
-            // Combinational round logic (zero latency)
-            // ------------------------------------------------------------------
+            // Compression input comes from stage WMSG_STAGES + gi
             sha256_round u_round (
-                .a_in  (pipe_a[gi]),
-                .b_in  (pipe_b[gi]),
-                .c_in  (pipe_c[gi]),
-                .d_in  (pipe_d[gi]),
-                .e_in  (pipe_e[gi]),
-                .f_in  (pipe_f[gi]),
-                .g_in  (pipe_g[gi]),
-                .h_in  (pipe_h[gi]),
-                .w_in  (W[gi]),
-                .k_in  (K[gi]),
+                .a_in  (pipe_a[WMSG_STAGES + gi]),
+                .b_in  (pipe_b[WMSG_STAGES + gi]),
+                .c_in  (pipe_c[WMSG_STAGES + gi]),
+                .d_in  (pipe_d[WMSG_STAGES + gi]),
+                .e_in  (pipe_e[WMSG_STAGES + gi]),
+                .f_in  (pipe_f[WMSG_STAGES + gi]),
+                .g_in  (pipe_g[WMSG_STAGES + gi]),
+                .h_in  (pipe_h[WMSG_STAGES + gi]),
+                .w_in  (W_all[gi]),     // W_all[gi] is registered: either block_r (r<16)
+                .k_in  (K[gi]),         // or W_pipe (r>=16), both properly timed.
                 .a_out (rnd_a_out[gi]),
                 .b_out (rnd_b_out[gi]),
                 .c_out (rnd_c_out[gi]),
@@ -255,82 +272,65 @@ module sha256_core (
                 .h_out (rnd_h_out[gi])
             );
 
-            // ------------------------------------------------------------------
-            // Pipeline register: capture round output
-            // ------------------------------------------------------------------
             always @(posedge clk) begin
                 if (!rst_n) begin
-                    pipe_a[gi+1] <= 32'b0;
-                    pipe_b[gi+1] <= 32'b0;
-                    pipe_c[gi+1] <= 32'b0;
-                    pipe_d[gi+1] <= 32'b0;
-                    pipe_e[gi+1] <= 32'b0;
-                    pipe_f[gi+1] <= 32'b0;
-                    pipe_g[gi+1] <= 32'b0;
-                    pipe_h[gi+1] <= 32'b0;
+                    pipe_a[WMSG_STAGES+gi+1] <= 32'b0;
+                    pipe_b[WMSG_STAGES+gi+1] <= 32'b0;
+                    pipe_c[WMSG_STAGES+gi+1] <= 32'b0;
+                    pipe_d[WMSG_STAGES+gi+1] <= 32'b0;
+                    pipe_e[WMSG_STAGES+gi+1] <= 32'b0;
+                    pipe_f[WMSG_STAGES+gi+1] <= 32'b0;
+                    pipe_g[WMSG_STAGES+gi+1] <= 32'b0;
+                    pipe_h[WMSG_STAGES+gi+1] <= 32'b0;
                 end else begin
-                    pipe_a[gi+1] <= rnd_a_out[gi];
-                    pipe_b[gi+1] <= rnd_b_out[gi];
-                    pipe_c[gi+1] <= rnd_c_out[gi];
-                    pipe_d[gi+1] <= rnd_d_out[gi];
-                    pipe_e[gi+1] <= rnd_e_out[gi];
-                    pipe_f[gi+1] <= rnd_f_out[gi];
-                    pipe_g[gi+1] <= rnd_g_out[gi];
-                    pipe_h[gi+1] <= rnd_h_out[gi];
+                    pipe_a[WMSG_STAGES+gi+1] <= rnd_a_out[gi];
+                    pipe_b[WMSG_STAGES+gi+1] <= rnd_b_out[gi];
+                    pipe_c[WMSG_STAGES+gi+1] <= rnd_c_out[gi];
+                    pipe_d[WMSG_STAGES+gi+1] <= rnd_d_out[gi];
+                    pipe_e[WMSG_STAGES+gi+1] <= rnd_e_out[gi];
+                    pipe_f[WMSG_STAGES+gi+1] <= rnd_f_out[gi];
+                    pipe_g[WMSG_STAGES+gi+1] <= rnd_g_out[gi];
+                    pipe_h[WMSG_STAGES+gi+1] <= rnd_h_out[gi];
                 end
             end
-
         end
     endgenerate
 
     // =========================================================================
-    // IV Pipeline: the initial hash values must be delayed ROUNDS cycles
-    // so they arrive at the adder when the corresponding working vars do.
-    // Shift register length = ROUNDS cycles.
+    // IV Delay Pipeline — must be LATENCY cycles long
+    // (now LATENCY = 71 instead of 65)
     // =========================================================================
-    reg [31:0] iv_pipe_h0 [0:ROUNDS-1];
-    reg [31:0] iv_pipe_h1 [0:ROUNDS-1];
-    reg [31:0] iv_pipe_h2 [0:ROUNDS-1];
-    reg [31:0] iv_pipe_h3 [0:ROUNDS-1];
-    reg [31:0] iv_pipe_h4 [0:ROUNDS-1];
-    reg [31:0] iv_pipe_h5 [0:ROUNDS-1];
-    reg [31:0] iv_pipe_h6 [0:ROUNDS-1];
-    reg [31:0] iv_pipe_h7 [0:ROUNDS-1];
+    reg [31:0] iv_pipe_h0 [0:LATENCY-2];
+    reg [31:0] iv_pipe_h1 [0:LATENCY-2];
+    reg [31:0] iv_pipe_h2 [0:LATENCY-2];
+    reg [31:0] iv_pipe_h3 [0:LATENCY-2];
+    reg [31:0] iv_pipe_h4 [0:LATENCY-2];
+    reg [31:0] iv_pipe_h5 [0:LATENCY-2];
+    reg [31:0] iv_pipe_h6 [0:LATENCY-2];
+    reg [31:0] iv_pipe_h7 [0:LATENCY-2];
 
     always @(posedge clk) begin
         if (!rst_n) begin
-            iv_pipe_h0[0] <= 32'b0;
-            iv_pipe_h1[0] <= 32'b0;
-            iv_pipe_h2[0] <= 32'b0;
-            iv_pipe_h3[0] <= 32'b0;
-            iv_pipe_h4[0] <= 32'b0;
-            iv_pipe_h5[0] <= 32'b0;
-            iv_pipe_h6[0] <= 32'b0;
-            iv_pipe_h7[0] <= 32'b0;
+            iv_pipe_h0[0] <= 32'b0; iv_pipe_h1[0] <= 32'b0;
+            iv_pipe_h2[0] <= 32'b0; iv_pipe_h3[0] <= 32'b0;
+            iv_pipe_h4[0] <= 32'b0; iv_pipe_h5[0] <= 32'b0;
+            iv_pipe_h6[0] <= 32'b0; iv_pipe_h7[0] <= 32'b0;
         end else begin
-            iv_pipe_h0[0] <= iv_h0;
-            iv_pipe_h1[0] <= iv_h1;
-            iv_pipe_h2[0] <= iv_h2;
-            iv_pipe_h3[0] <= iv_h3;
-            iv_pipe_h4[0] <= iv_h4;
-            iv_pipe_h5[0] <= iv_h5;
-            iv_pipe_h6[0] <= iv_h6;
-            iv_pipe_h7[0] <= iv_h7;
+            iv_pipe_h0[0] <= iv_h0; iv_pipe_h1[0] <= iv_h1;
+            iv_pipe_h2[0] <= iv_h2; iv_pipe_h3[0] <= iv_h3;
+            iv_pipe_h4[0] <= iv_h4; iv_pipe_h5[0] <= iv_h5;
+            iv_pipe_h6[0] <= iv_h6; iv_pipe_h7[0] <= iv_h7;
         end
     end
 
     generate
-        for (gi = 1; gi < ROUNDS; gi = gi + 1) begin : IV_PIPE
+        for (gi = 1; gi < LATENCY-1; gi = gi + 1) begin : IV_PIPE
             always @(posedge clk) begin
                 if (!rst_n) begin
-                    iv_pipe_h0[gi] <= 32'b0;
-                    iv_pipe_h1[gi] <= 32'b0;
-                    iv_pipe_h2[gi] <= 32'b0;
-                    iv_pipe_h3[gi] <= 32'b0;
-                    iv_pipe_h4[gi] <= 32'b0;
-                    iv_pipe_h5[gi] <= 32'b0;
-                    iv_pipe_h6[gi] <= 32'b0;
-                    iv_pipe_h7[gi] <= 32'b0;
+                    iv_pipe_h0[gi] <= 32'b0; iv_pipe_h1[gi] <= 32'b0;
+                    iv_pipe_h2[gi] <= 32'b0; iv_pipe_h3[gi] <= 32'b0;
+                    iv_pipe_h4[gi] <= 32'b0; iv_pipe_h5[gi] <= 32'b0;
+                    iv_pipe_h6[gi] <= 32'b0; iv_pipe_h7[gi] <= 32'b0;
                 end else begin
                     iv_pipe_h0[gi] <= iv_pipe_h0[gi-1];
                     iv_pipe_h1[gi] <= iv_pipe_h1[gi-1];
@@ -346,8 +346,7 @@ module sha256_core (
     endgenerate
 
     // =========================================================================
-    // Valid Signal Pipeline
-    // Shift block_valid through LATENCY stages to produce hash_valid
+    // Valid Signal Pipeline — LATENCY = 71 bits
     // =========================================================================
     reg [LATENCY-1:0] valid_pipe;
 
@@ -359,7 +358,8 @@ module sha256_core (
     end
 
     // =========================================================================
-    // Final Stage: Add compressed vars back to IV (FIPS 180-4 §6.2.2 Step 4)
+    // Final Stage: Add compressed working vars back to IV
+    // (FIPS 180-4 §6.2.2 Step 4)
     // =========================================================================
     always @(posedge clk) begin
         if (!rst_n) begin
@@ -368,14 +368,14 @@ module sha256_core (
         end else begin
             hash_valid <= valid_pipe[LATENCY-1];
             if (valid_pipe[LATENCY-1]) begin
-                hash_out[255:224] <= pipe_a[ROUNDS] + iv_pipe_h0[ROUNDS-1];
-                hash_out[223:192] <= pipe_b[ROUNDS] + iv_pipe_h1[ROUNDS-1];
-                hash_out[191:160] <= pipe_c[ROUNDS] + iv_pipe_h2[ROUNDS-1];
-                hash_out[159:128] <= pipe_d[ROUNDS] + iv_pipe_h3[ROUNDS-1];
-                hash_out[127: 96] <= pipe_e[ROUNDS] + iv_pipe_h4[ROUNDS-1];
-                hash_out[ 95: 64] <= pipe_f[ROUNDS] + iv_pipe_h5[ROUNDS-1];
-                hash_out[ 63: 32] <= pipe_g[ROUNDS] + iv_pipe_h6[ROUNDS-1];
-                hash_out[ 31:  0] <= pipe_h[ROUNDS] + iv_pipe_h7[ROUNDS-1];
+                hash_out[255:224] <= pipe_a[PIPE_DEPTH] + iv_pipe_h0[LATENCY-2];
+                hash_out[223:192] <= pipe_b[PIPE_DEPTH] + iv_pipe_h1[LATENCY-2];
+                hash_out[191:160] <= pipe_c[PIPE_DEPTH] + iv_pipe_h2[LATENCY-2];
+                hash_out[159:128] <= pipe_d[PIPE_DEPTH] + iv_pipe_h3[LATENCY-2];
+                hash_out[127: 96] <= pipe_e[PIPE_DEPTH] + iv_pipe_h4[LATENCY-2];
+                hash_out[ 95: 64] <= pipe_f[PIPE_DEPTH] + iv_pipe_h5[LATENCY-2];
+                hash_out[ 63: 32] <= pipe_g[PIPE_DEPTH] + iv_pipe_h6[LATENCY-2];
+                hash_out[ 31:  0] <= pipe_h[PIPE_DEPTH] + iv_pipe_h7[LATENCY-2];
             end
         end
     end
