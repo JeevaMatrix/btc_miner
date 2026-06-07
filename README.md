@@ -40,6 +40,67 @@ This is not a full Bitcoin node. It is the hash engine that a mining controller
 
 ---
 
+## How to simulate
+
+### Requirements
+
+- Icarus Verilog (`iverilog`) ≥ 10.0
+- GTKWave (optional, for waveform viewing)
+
+Install on Ubuntu/Debian:
+```bash
+sudo apt install iverilog gtkwave
+```
+
+Install on macOS:
+```bash
+brew install icarus-verilog gtkwave
+```
+
+### Run the full miner testbench
+
+```bash
+cd Bitcoin/
+
+iverilog -g2005-sv -I sha256 \
+  -o miner_sim \
+  sha256/sha256_functions.vh \
+  sha256/sha256_round.v \
+  sha256/sha256_core.v \
+  job_loader.v \
+  nonce_ctrl.v \
+  difficulty_comparator.v \
+  bitcoin_miner_top.v \
+  bitcoin_miner_tb.v
+
+vvp miner_sim
+```
+
+### Run the SHA-256 unit test (NIST vectors)
+
+```bash
+cd Bitcoin/sha256/
+
+iverilog -g2005-sv \
+  -o sha256_sim \
+  sha256_functions.vh \
+  sha256_round.v \
+  sha256_core.v \
+  sha256_tb.v
+
+vvp sha256_sim
+```
+
+Expected output: SHA256("abc") and SHA256("") pass. NIST verified.
+
+### View waveforms
+
+```bash
+gtkwave bitcoin_miner_tb.vcd
+```
+
+---
+
 ## Repository structure
 
 ```
